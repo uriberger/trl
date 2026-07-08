@@ -62,6 +62,9 @@ accelerate launch \
 
 """
 
+import os
+import re
+
 import torch
 from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
@@ -78,6 +81,79 @@ from trl import (
     get_quantization_config,
 )
 from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
+
+
+def maybe_wandb_rewind(trainer, training_args):
+    """When resuming from a checkpoint, rewind the existing wandb run back to the
+    checkpoint's step so the reloaded curve overwrites the doomed pre-crash tail —
+    yielding one clean run "as if it never crashed" instead of a fork or a run
+    with a visible seam.
+
+    Works by pre-initializing wandb with `resume_from` before the Trainer's
+    WandbCallback runs; the callback then reuses the existing run (it only calls
+    wandb.init when wandb.run is None). No-op unless we're resuming, wandb
+    reporting is on/online, we're the main process, and WANDB_RUN_ID is set.
+    """
+    # Opt-in only: wandb's resume_from (rewind) is a private-preview feature and
+    # returns HTTP 400 unless enabled on the account. Skip it by default and rely
+    # on WANDB_RESUME=allow (set in the launch script) to continue the same run.
+    # Set WANDB_REWIND=1 to attempt the clean truncated rewind once you have access.
+    if os.environ.get("WANDB_REWIND", "").lower() not in ("1", "true", "yes"):
+        return
+    if not training_args.resume_from_checkpoint:
+        return
+    report_to = training_args.report_to or []
+    if isinstance(report_to, str):
+        report_to = [report_to]
+    if "wandb" not in report_to:
+        return
+    if os.environ.get("WANDB_MODE", "").lower() == "offline":
+        return
+    if not trainer.is_world_process_zero():
+        return
+    run_id = os.environ.get("WANDB_RUN_ID")
+    if not run_id:
+        return
+
+    # Resolve the step of the checkpoint we're resuming from (latest checkpoint-<N>
+    # in output_dir, unless an explicit checkpoint path was given).
+    resume = training_args.resume_from_checkpoint
+    ckpt_dir = resume if isinstance(resume, str) and os.path.isdir(resume) else None
+    if ckpt_dir is None:
+        candidates = []
+        for name in os.listdir(training_args.output_dir):
+            m = re.fullmatch(r"checkpoint-(\d+)", name)
+            if m and os.path.isdir(os.path.join(training_args.output_dir, name)):
+                candidates.append((int(m.group(1)), name))
+        if not candidates:
+            return
+        _, name = max(candidates)
+        ckpt_dir = os.path.join(training_args.output_dir, name)
+    m = re.search(r"checkpoint-(\d+)", os.path.basename(ckpt_dir))
+    if not m:
+        return
+    step = int(m.group(1))
+
+    try:
+        import wandb
+    except ImportError:
+        return
+
+    # resume_from (rewind) and resume are mutually exclusive; drop the env resume
+    # flag we set in the launch script so wandb.init doesn't reject the call.
+    os.environ.pop("WANDB_RESUME", None)
+    try:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            resume_from=f"{run_id}?_step={step}",
+        )
+        print(f"[wandb-rewind] rewound run {run_id} to step {step}; Trainer will reuse this run.")
+    except Exception as e:
+        # Older wandb without rewind support, or a bad id -> fall back to plain
+        # resume so we at least continue the same run (with a seam).
+        os.environ["WANDB_RESUME"] = "allow"
+        print(f"[wandb-rewind] rewind unavailable ({e}); falling back to WANDB_RESUME=allow.")
 
 
 if __name__ == "__main__":
@@ -209,6 +285,8 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
     )
+
+    maybe_wandb_rewind(trainer, training_args)
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
