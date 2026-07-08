@@ -59,7 +59,6 @@ accelerate launch \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 2 \
     --num_generations 2  \
-    --bf16 True
 
 """
 
@@ -78,7 +77,7 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.rewards import think_format_reward
+from trl.rewards import think_format_reward, think_saliency_reward, openai_reward
 
 
 if __name__ == "__main__":
@@ -102,15 +101,23 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    dataset = load_dataset("lmms-lab/multimodal-open-r1-8k-verified", split="train")
+    dataset = load_dataset("peterant330/saliency-r1-8k", split="train")
     dataset = dataset.train_test_split(test_size=100, seed=42)
-
+    '''
     SYSTEM_PROMPT = (
-        "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
-        "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-        "The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my "
-        "reasoning.\n</think>\nThis is my answer."
+        "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+        "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, "
+        "i.e., <think> reasoning process here </think> <answer> answer here </answer>."
     )
+    '''
+    SYSTEM_PROMPT = (
+        "A conversation between user and assistant. The user asks a question, and the assistant solves it. "
+        "The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think></think> tags, "
+        "i.e., <think>\nThis is my reasoning.\n</think>\nThis is my answer."
+    )
+
 
     def make_conversation(example):
         prompt = [
@@ -124,7 +131,7 @@ if __name__ == "__main__":
     # Filter have big images
     def filter_big_images(example):
         image = example["image"]
-        return image.size[0] < 512 and image.size[1] < 512
+        return image.size[0] <= 512 and image.size[1] <= 512
 
     dataset = dataset.filter(filter_big_images)
 
@@ -148,8 +155,11 @@ if __name__ == "__main__":
         - If both gold and prediction are parseable → use math verification.
         - If not parseable → compare as normalized text.
         """
+
         rewards = []
         contents = [completion[0]["content"] for completion in completions]
+        print(completions[0])
+        print(contents[0])
         for content, sol in zip(contents, solution):
             try:
                 gold_parsed = parse(sol, extraction_mode="first_match")
@@ -194,13 +204,13 @@ if __name__ == "__main__":
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
-        reward_funcs=[think_format_reward, accuracy_reward],
+        reward_funcs=[think_format_reward, think_saliency_reward, openai_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)

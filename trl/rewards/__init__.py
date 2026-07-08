@@ -21,12 +21,17 @@ from ..import_utils import _LazyModule
 
 _import_structure = {
     "format_rewards": ["think_format_reward"],
+    "saliency_rewards": ["think_saliency_reward"],
+    "openai_rewards": ["openai_reward"],
+    "answer_format_rewards": ["answer_format_reward"]
 }
 
 
 if TYPE_CHECKING:
     from .format_rewards import think_format_reward
-
+    from .saliency_rewards import think_saliency_reward
+    from .openai_rewards import openai_reward
+    from .answer_format_rewards import answer_format_reward
 
 else:
     sys.modules[__name__] = _LazyModule(__name__, __file__, _import_structure, module_spec=__spec__)

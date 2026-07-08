@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.21.0"
+__version__ = "0.22.0.dev0"
 
 from typing import TYPE_CHECKING
 
@@ -63,6 +63,9 @@ _import_structure = {
         "GKDTrainer",
         "GRPOConfig",
         "GRPOTrainer",
+        "GRPOATTNTrainer",
+        "GRPOATTNV2Trainer",
+        "GRPOATTNV3Trainer",
         "HfPairwiseJudge",
         "IterativeSFTConfig",
         "IterativeSFTTrainer",
@@ -157,6 +160,9 @@ if TYPE_CHECKING:
         GKDTrainer,
         GRPOConfig,
         GRPOTrainer,
+        GRPOATTNTrainer,
+        GRPOATTNV2Trainer,
+        GRPOATTNV3Trainer,
         HfPairwiseJudge,
         IterativeSFTConfig,
         IterativeSFTTrainer,

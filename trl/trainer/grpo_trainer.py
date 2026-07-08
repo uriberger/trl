@@ -67,6 +67,7 @@ from .utils import (
     print_prompt_completions_sample,
     selective_log_softmax,
 )
+import cv2
 
 
 if is_peft_available():
@@ -86,6 +87,10 @@ if is_wandb_available():
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
+def repeat_v(hidden_states, n_rep):
+    batch,  num_key_value_heads, slen, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:,:,None,:,:].expand(batch, num_key_value_heads,n_rep, slen, head_dim)
+    return hidden_states.reshape(batch,num_key_value_heads*n_rep, slen, head_dim)
 
 class RepeatSampler(Sampler):
     """
@@ -555,6 +560,12 @@ class GRPOTrainer(Trainer):
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
+        self.is_gradient_checkpointing = args.gradient_checkpointing
+
+        self.NUM_LAYER = len(model.language_model.layers)
+        self.NUM_GROUP = model.language_model.layers[0].self_attn.k_proj.in_features // model.language_model.layers[
+            0].self_attn.k_proj.out_features
+        self.DIMS = model.lm_head.in_features
 
         # Processing class
         if processing_class is None:
@@ -820,6 +831,8 @@ class GRPOTrainer(Trainer):
                     max_num_batched_tokens=4096,
                     model_impl=self.args.vllm_model_impl,
                 )
+            else:
+                raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.vllm_mode}'.")
 
             # vLLM specific sampling arguments
             self.guided_decoding_regex = args.vllm_guided_decoding_regex
@@ -1290,7 +1303,7 @@ class GRPOTrainer(Trainer):
         return inputs
 
     @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list, attn_map, valid_list):
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
@@ -1300,6 +1313,9 @@ class GRPOTrainer(Trainer):
 
         # This allows for dynamic reward shaping based on training progress.
         reward_kwargs["trainer_state"] = self.state
+
+        bbox_list = [i['bbox'] for i in inputs]
+        question_list = [i['problem'] for i in inputs]
 
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
@@ -1319,7 +1335,8 @@ class GRPOTrainer(Trainer):
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
                     output_reward_func = reward_func(
-                        prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+                        prompts=question_list, completions=completions, completion_ids=completion_ids_list,
+                        saliency_map=attn_map, valid_list=valid_list, bbox_list=bbox_list, **reward_kwargs
                     )
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
@@ -1404,14 +1421,32 @@ class GRPOTrainer(Trainer):
             )
             prompts_text = [re.sub(rf"^({re.escape(self.pad_token)})+", "", text) for text in prompts_text]
 
-            # The chat template inserts a single image token into the prompt text. However, when this text is later
-            # tokenized, the single image token string is expanded into multiple image token IDs, depending on the
+            # The chat template sometimes inserts a single image token into the prompt text. However, when this text is
+            # later tokenized, the single image token string is expanded into multiple image token IDs, depending on the
             # image size. Since we're detokenizing here, we may see repeated image tokens in the decoded text. We
-            # collapse them back into a single token string to match the original template.
+            # collapse them back into a single token string to match the original chat template in case it originally
+            # applies it. Otherwise, it assumes that the chat template uses only vision_start_token_id to indicate images
+            # (e.g. Gemma 3) and removes all image_token instances and vision_end_token_id as well, leaving only
+            # the vision_start_token_id (e.g. <start_of_image>).
             if self.image_token is not None:
-                prompts_text = [
-                    re.sub(rf"({re.escape(self.image_token)})+", self.image_token, text) for text in prompts_text
-                ]
+                escaped_img_token = re.escape(self.image_token)
+                # Search for the image token in the chat template
+                if re.search(escaped_img_token, self.processing_class.chat_template):
+                    prompts_text = [
+                        re.sub(rf"({escaped_img_token})+", self.image_token, text) for text in prompts_text
+                    ]
+                else:
+                    # If the chat template doesn't use the image token, we remove all instances of it + vision_end_token_id
+                    if self.vision_end_token_id is not None:
+                        escaped_eoi_token = re.escape(
+                            self.processing_class.tokenizer.decode([self.vision_end_token_id])
+                        )
+                        prompts_text = [
+                            re.sub(rf"({escaped_img_token})+{escaped_eoi_token}", "", text) for text in prompts_text
+                        ]
+                    else:
+                        # If vision_end_token_id is None, just remove the image tokens
+                        prompts_text = [re.sub(rf"({escaped_img_token})+", "", text) for text in prompts_text]
 
         # Generate completions using either vLLM or regular generation
         if self.use_vllm:
@@ -1470,7 +1505,7 @@ class GRPOTrainer(Trainer):
                     guided_decoding = None
 
                 generation_kwargs = {
-                    "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
+                    "n": 1,
                     "repetition_penalty": self.repetition_penalty,
                     "temperature": self.temperature,
                     "top_p": self.top_p,
@@ -1484,8 +1519,6 @@ class GRPOTrainer(Trainer):
                 sampling_params = SamplingParams(**generation_kwargs)
 
                 if self.vllm_tensor_parallel_size > 1:
-                    # Gather prompts from all ranks in the TP group and flatten.
-                    # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
                     orig_size = len(prompts_text)
                     gathered_prompts = [None for _ in range(self.vllm_tensor_parallel_size)]
                     torch.distributed.all_gather_object(gathered_prompts, prompts_text, group=self.tp_group)
@@ -1502,12 +1535,10 @@ class GRPOTrainer(Trainer):
                     all_images = images if has_images else None
 
                 if has_images and all_images:
-                    vllm_inputs = []
-                    for prompt, image in zip(all_prompts_text, all_images):
-                        if image is not None:
-                            vllm_inputs.append({"prompt": prompt, "multi_modal_data": {"image": image}})
-                        else:
-                            vllm_inputs.append(prompt)
+                    vllm_inputs = [
+                        {"prompt": prompt, "multi_modal_data": {"image": image}} if image is not None else prompt
+                        for prompt, image in zip(all_prompts_text, all_images)
+                    ]
                 else:
                     vllm_inputs = all_prompts_text
 
@@ -1517,8 +1548,6 @@ class GRPOTrainer(Trainer):
                 completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
 
                 if self.vllm_tensor_parallel_size > 1:
-                    # Slice completions for this rank within its TP group.
-                    # Each rank generates all outputs — we keep only our share.
                     local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
                     tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
                     completion_ids = completion_ids[tp_slice]
@@ -1564,6 +1593,7 @@ class GRPOTrainer(Trainer):
             # Restore the original attention implementation, training mode
             self.model_wrapped.config._attn_implementation = previous_attn
         else:
+            '''
             # Regular generation path
             with (
                 profiling_context(self, "transformers.generate"),
@@ -1577,10 +1607,49 @@ class GRPOTrainer(Trainer):
                 prompt_completion_ids = unwrapped_model.generate(
                     **prompt_inputs, generation_config=self.generation_config, disable_compile=True
                 )
+                
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+            '''
+
+            with (
+                profiling_context(self, "transformers.generate"),
+                unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as unwrapped_model,
+                torch.no_grad(),
+                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+            ):
+                if self.is_gradient_checkpointing:
+                    unwrapped_model.base_model.gradient_checkpointing_disable()
+                # 设置 prompt 输入，确保正确传递给模型
+                prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
+                # 调用 generate 方法并启用 return_dict_in_generate 和 output_attentions
+                #self.generation_config.temperature = 1.0
+                outputs = unwrapped_model.generate(
+                    **prompt_inputs,
+                    generation_config=self.generation_config,
+                    temperature=1.0,
+                    use_cache=True,
+                    disable_compile=True,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,  # 返回字典格式的结果
+                    output_attentions=True  # 输出 attention weights
+                )
+                if self.is_gradient_checkpointing:
+                    unwrapped_model.base_model.gradient_checkpointing_enable()
+
+            # 提取生成的 tokens 和 attention weights
+            prompt_completion_ids = outputs.sequences  # 从 outputs 中获取生成的序列
+            attentions = outputs.attentions  # 提取 attention weights
+            #print(attentions[0])
+
+            # 计算 prompt 长度并分割生成的序列
+            prompt_length = prompt_ids.size(1)
+            prompt_ids = prompt_completion_ids[:, :prompt_length]  # 提取 prompt 部分
+            completion_ids = prompt_completion_ids[:, prompt_length:]  # 提取 completion 部分
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
@@ -1671,10 +1740,120 @@ class GRPOTrainer(Trainer):
         else:
             completions = completions_text
 
+        output_text = self.processing_class.batch_decode(
+            completion_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
+        out = self.processing_class.tokenizer(output_text)
+
+
+        pattern = r"^<think>\s*([^\s].*?)\s*</think>\s*([^\s].*?)\s*$"
+        completion_contents = [completion[0]["content"] for completion in completions]
+
+        def judge_format(pattern, response):
+            return re.match(pattern, response, re.DOTALL | re.MULTILINE) is not None and \
+                response.count('<think>') == 1 and response.count('</think>') == 1
+        invalid = [judge_format(pattern, content) for content in completion_contents]
+
+        think_start_idx = [re.search(r"<think>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        think_end_idx = [re.search(r"(\S)\s*</think>", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        answer_start_idx = [re.search(r"</think>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        answer_end_idx = [re.search(r"(\S)\s*<\|im_end\|>", i, re.DOTALL | re.MULTILINE) for i in output_text]
+
+        think_start_idx = [i.start(1) if i else -1 for i in think_start_idx]
+        think_end_idx = [i.start(1) if i else -1 for i in think_end_idx]
+        answer_start_idx = [i.start(1) if i else -1 for i in answer_start_idx]
+        answer_end_idx = [i.start(1) if i else -1 for i in answer_end_idx]
+
+        think_start = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(think_start_idx)]
+        think_end = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(think_end_idx)]
+        answer_start = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_start_idx)]
+        answer_end = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_end_idx)]
+
+        think_end = [i if j else 0 for i, j in zip(think_end, invalid)]
+        think_start = [min(i, z) if j else 0 for i, j, z in zip(think_start, invalid, think_end)]
+        answer_end = [min(i, len(attentions) - 1) if j else 1 for i, j in zip(answer_end, invalid)]
+        answer_start = [min(z, i) if j else 1 for i, j, z in zip(answer_start, invalid, answer_end)]
+
+
+        '''
+        pattern = r'.*<think>\s*([^\s].*?)\s*</think>.*<answer>\s*([^\s].*?)\s*</answer>.*'
+        completion_contents = [completion[0]["content"] for completion in completions]
+
+        def judge_format(pattern, response):
+            return re.match(pattern, response, re.DOTALL | re.MULTILINE) is not None and \
+                response.count('<think>') == 1 and response.count('</think>') == 1 and \
+                response.count('<answer>') == 1 and response.count('</answer>') == 1
+
+        invalid = [judge_format(pattern, content) for content in completion_contents]
+        attn_batch = []
+        #debug = [k for i, j, z, k in zip(think_start_idx, think_end_idx, invalid, output_text) if z and (i<0 or j<0)]
+        #print(debug)
+        
+        think_start_idx = [re.search(r"<think>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        think_end_idx = [re.search(r"(\S)\s*</think>", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        answer_start_idx = [re.search(r"<answer>\s*(\S\S*)", i, re.DOTALL | re.MULTILINE) for i in output_text]
+        answer_end_idx = [re.search(r"(\S)\s*</answer>", i, re.DOTALL | re.MULTILINE) for i in output_text]
+
+        think_start_idx = [i.start(1) if i else -1 for i in think_start_idx]
+        think_end_idx = [i.start(1) if i else -1 for i in think_end_idx]
+        answer_start_idx = [i.start(1) if i else -1 for i in answer_start_idx]
+        answer_end_idx = [i.start(1) if i else -1 for i in answer_end_idx]
+
+
+        think_start = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(think_start_idx)]
+        think_end = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(think_end_idx)]
+        answer_start = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_start_idx)]
+        answer_end = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_end_idx)]
+        
+        think_end = [i if j else 0 for i, j in zip(think_end, invalid)]
+        think_start = [min(i, z) if j else 0 for i, j, z in zip(think_start, invalid, think_end)]
+        answer_end = [min(i, len(attentions) - 1) if j else 1 for i, j in zip(answer_end, invalid)]
+        answer_start = [min(z, i) if j else 1 for i, j, z in zip(answer_start, invalid, answer_end)]
+        '''
+        attn_batch = []
+
+        with torch.no_grad():
+            for case_id in range(len(images)):
+                logits = 0
+                for layers in range(self.NUM_LAYER):
+                    value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
+                    value_states = repeat_v(value_states, self.NUM_GROUP)
+                    value_states = value_states[:, :, :prompt_length, :]
+                    value_states = value_states[:, :, prompt_ids[case_id] == 151655, :]
+                    think_attn = torch.cat([attentions[answer_token][layers] \
+                                                [[case_id], :, -1:,
+                                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1] \
+                                            for answer_token in range(answer_start[case_id], answer_end[case_id] + 1)],
+                                           dim=0)
+                    token_attn = torch.cat([attentions[i][layers][[case_id]][:, :, -1:,
+                                            prompt_completion_ids[case_id, :i + prompt_length] == 151655] \
+                                            for i in range(think_start[case_id], think_end[case_id] + 1)], dim=2)
+                    token_attn = token_attn[:, :, :think_attn.shape[-1], :]
+                    agg_attn = (think_attn @ token_attn).transpose(2, 3)
+                    sv = (agg_attn * value_states).transpose(1, 2).reshape(len(think_attn), -1, self.DIMS)
+                    logits += self.model.language_model.layers[layers].self_attn.o_proj(sv)
+                logits = self.model.language_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
+                hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in \
+                           range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
+                logits = logits / hidden_norm
+                out = self.model.lm_head(logits)
+                indices = [completion_ids[case_id][answer_token] for answer_token in
+                           range(answer_start[case_id], answer_end[case_id] + 1)]
+                out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
+                    prompt_inputs.get("image_grid_thw")[case_id, 1]//2,
+                    prompt_inputs.get("image_grid_thw")[case_id, 2]//2)
+                saliency = torch.relu(out).detach().cpu().float().numpy()
+                saliency = cv2.resize(saliency, images[case_id].size)
+                attn_batch.append(saliency)
+
+        torch.cuda.empty_cache()
+
+
+
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
-        rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions, completion_ids_list)
+        rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions, completion_ids_list, attn_batch, invalid)
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
@@ -1729,6 +1908,12 @@ class GRPOTrainer(Trainer):
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        # Overall (weighted-sum) reward mean/std across ALL rollouts, in the same
+        # rewards/* namespace and same "across rollouts" semantics as the per-function
+        # stats above. Note: this /std differs from `reward_std`, which is the mean
+        # within-group std used for GRPO advantage normalization.
+        self._metrics[mode]["rewards/overall/mean"].append(torch.nanmean(rewards).item())
+        self._metrics[mode]["rewards/overall/std"].append(nanstd(rewards).item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
