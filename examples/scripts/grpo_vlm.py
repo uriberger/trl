@@ -64,11 +64,61 @@ accelerate launch \
 
 import os
 import re
+import shutil
 
 import torch
 from datasets import load_dataset
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
+
+from transformers import TrainerCallback
+
+
+class TieredCheckpointCallback(TrainerCallback):
+    """Keep every `milestone_steps` checkpoint permanently; for all other
+    `frequent_steps` checkpoints, keep only the most recent one.
+
+    Example: frequent_steps=10, milestone_steps=200
+      step 620 saved  -> last_frequent=620
+      step 630 saved  -> delete checkpoint-620, last_frequent=630
+      step 200 saved  -> delete last_frequent (190), last_frequent=None (permanent)
+      step 210 saved  -> last_frequent=210 (nothing to delete, 200 was permanent)
+    """
+
+    def __init__(self, output_dir, frequent_steps=10, milestone_steps=200):
+        self.output_dir = output_dir
+        self.frequent_steps = frequent_steps
+        self.milestone_steps = milestone_steps
+        # On init (including after resume), find the most recent frequent
+        # (non-milestone) checkpoint so we can delete it on the next save.
+        self._last_frequent_step = self._scan_last_frequent()
+
+    def _scan_last_frequent(self):
+        if not os.path.isdir(self.output_dir):
+            return None
+        candidates = []
+        for name in os.listdir(self.output_dir):
+            m = re.fullmatch(r"checkpoint-(\d+)", name)
+            if m:
+                step = int(m.group(1))
+                if step % self.frequent_steps == 0 and step % self.milestone_steps != 0:
+                    candidates.append(step)
+        return max(candidates) if candidates else None
+
+    def on_save(self, args, state, control, **kwargs):
+        if args.process_index != 0:
+            return
+        step = state.global_step
+        if self._last_frequent_step is not None:
+            ckpt = os.path.join(self.output_dir, f"checkpoint-{self._last_frequent_step}")
+            if os.path.isdir(ckpt):
+                shutil.rmtree(ckpt)
+                print(f"[TieredCheckpoint] deleted checkpoint-{self._last_frequent_step}")
+        if step % self.milestone_steps != 0:
+            self._last_frequent_step = step
+        else:
+            self._last_frequent_step = None
+
 
 from trl import (
     GRPOConfig,
@@ -234,9 +284,11 @@ if __name__ == "__main__":
 
         rewards = []
         contents = [completion[0]["content"] for completion in completions]
-        print(completions[0])
-        print(contents[0])
         for content, sol in zip(contents, solution):
+            # Extract answer portion after </think>; fall back to full content
+            m = re.search(r"</think>\s*(.*?)\s*$", content, re.DOTALL)
+            answer_text = m.group(1).strip() if m else content.strip()
+
             try:
                 gold_parsed = parse(sol, extraction_mode="first_match")
             except Exception:
@@ -246,7 +298,7 @@ if __name__ == "__main__":
                 # Try parsing predicted answer too
                 try:
                     answer_parsed = parse(
-                        content,
+                        answer_text,
                         extraction_config=[
                             LatexExtractionConfig(
                                 normalization_config=NormalizationConfig(
@@ -264,11 +316,11 @@ if __name__ == "__main__":
                     )
                     reward = float(verify(gold_parsed, answer_parsed))
                 except Exception as e:
-                    print(f"verify failed: {e}, answer: {content}, gold: {sol}")
+                    print(f"verify failed: {e}, answer: {answer_text}, gold: {sol}")
                     reward = None
             else:
                 # fallback to text match
-                reward = float(content.strip().lower() == sol.strip().lower())
+                reward = float(answer_text.lower() == sol.strip().lower())
 
             rewards.append(reward)
 
@@ -285,6 +337,7 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
     )
+    trainer.add_callback(TieredCheckpointCallback(training_args.output_dir))
 
     maybe_wandb_rewind(trainer, training_args)
 
