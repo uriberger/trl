@@ -1035,6 +1035,14 @@ class GRPOTrainer(Trainer):
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
 
+        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to cover completion tokens
+        if mm_token_type_ids is not None and mm_token_type_ids.size(1) < input_ids.size(1):
+            pad_len = input_ids.size(1) - mm_token_type_ids.size(1)
+            mm_token_type_ids = torch.cat(
+                [mm_token_type_ids, torch.zeros(mm_token_type_ids.size(0), pad_len, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device)],
+                dim=1,
+            )
+
         # Build model inputs - check if the model supports logits_to_keep (some models and VLMs don't)
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
 
@@ -1112,6 +1120,13 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Optional[torch.Tensor]]:
         """Compute log-probs and (optionally) entropies for each token."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+        # mm_token_type_ids comes from prompt_inputs only; pad with zeros (text type) to cover completion tokens
+        if mm_token_type_ids is not None and mm_token_type_ids.size(1) < input_ids.size(1):
+            pad_len = input_ids.size(1) - mm_token_type_ids.size(1)
+            mm_token_type_ids = torch.cat(
+                [mm_token_type_ids, torch.zeros(mm_token_type_ids.size(0), pad_len, dtype=mm_token_type_ids.dtype, device=mm_token_type_ids.device)],
+                dim=1,
+            )
         all_logps = []
         all_entropies = []
         for start in range(0, input_ids.size(0), batch_size):
