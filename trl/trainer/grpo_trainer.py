@@ -1746,7 +1746,7 @@ class GRPOTrainer(Trainer):
         out = self.processing_class.tokenizer(output_text)
 
 
-        pattern = r"^<think>\s*([^\s].*?)\s*</think>\s*([^\s].*?)\s*$"
+        pattern = r"^\s*<think>\s*([^\s].*?)\s*</think>\s*([^\s].*?)\s*$"
         completion_contents = [completion[0]["content"] for completion in completions]
 
         def judge_format(pattern, response):
