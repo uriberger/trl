@@ -509,7 +509,10 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        reforward_saliency: bool = True,
     ):
+        self.reforward_saliency = reforward_saliency
+
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
@@ -1657,31 +1660,26 @@ class GRPOTrainer(Trainer):
             ):
                 if self.is_gradient_checkpointing:
                     unwrapped_model.base_model.gradient_checkpointing_disable()
-                # 设置 prompt 输入，确保正确传递给模型
                 prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
-                # 调用 generate 方法并启用 return_dict_in_generate 和 output_attentions
-                #self.generation_config.temperature = 1.0
-                outputs = unwrapped_model.generate(
-                    **prompt_inputs,
+                _gen_kwargs = dict(
                     generation_config=self.generation_config,
                     temperature=1.0,
                     use_cache=True,
                     output_hidden_states=True,
-                    return_dict_in_generate=True,  # 返回字典格式的结果
-                    output_attentions=True  # 输出 attention weights
+                    return_dict_in_generate=True,
                 )
+                if not self.reforward_saliency:
+                    _gen_kwargs["output_attentions"] = True
+                outputs = unwrapped_model.generate(**prompt_inputs, **_gen_kwargs)
                 if self.is_gradient_checkpointing:
                     unwrapped_model.base_model.gradient_checkpointing_enable()
 
-            # 提取生成的 tokens 和 attention weights
-            prompt_completion_ids = outputs.sequences  # 从 outputs 中获取生成的序列
-            attentions = outputs.attentions  # 提取 attention weights
-            #print(attentions[0])
-
-            # 计算 prompt 长度并分割生成的序列
+            prompt_completion_ids = outputs.sequences
+            if not self.reforward_saliency:
+                attentions = outputs.attentions
             prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]  # 提取 prompt 部分
-            completion_ids = prompt_completion_ids[:, prompt_length:]  # 提取 completion 部分
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
@@ -1804,9 +1802,10 @@ class GRPOTrainer(Trainer):
         answer_start = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_start_idx)]
         answer_end = [out.char_to_token(b, i) if i >= 0 else -1 for b, i in enumerate(answer_end_idx)]
 
+        _max_completion_idx = (len(attentions) - 1) if not self.reforward_saliency else (completion_ids.size(1) - 1)
         think_end = [i if j else 0 for i, j in zip(think_end, invalid)]
         think_start = [min(i, z) if j else 0 for i, j, z in zip(think_start, invalid, think_end)]
-        answer_end = [min(i, len(attentions) - 1) if j else 1 for i, j in zip(answer_end, invalid)]
+        answer_end = [min(i, _max_completion_idx) if j else 1 for i, j in zip(answer_end, invalid)]
         answer_start = [min(z, i) if j else 1 for i, j, z in zip(answer_start, invalid, answer_end)]
 
 
@@ -1847,39 +1846,137 @@ class GRPOTrainer(Trainer):
         '''
         attn_batch = []
 
-        with torch.no_grad():
-            for case_id in range(len(images)):
-                logits = 0
-                for layers in range(self.NUM_LAYER):
-                    value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
-                    value_states = repeat_v(value_states, self.NUM_GROUP)
-                    value_states = value_states[:, :, :prompt_length, :]
-                    value_states = value_states[:, :, prompt_ids[case_id] == 151655, :]
-                    think_attn = torch.cat([attentions[answer_token][layers] \
-                                                [[case_id], :, -1:,
-                                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1] \
-                                            for answer_token in range(answer_start[case_id], answer_end[case_id] + 1)],
-                                           dim=0)
-                    token_attn = torch.cat([attentions[i][layers][[case_id]][:, :, -1:,
-                                            prompt_completion_ids[case_id, :i + prompt_length] == 151655] \
-                                            for i in range(think_start[case_id], think_end[case_id] + 1)], dim=2)
-                    token_attn = token_attn[:, :, :think_attn.shape[-1], :]
-                    agg_attn = (think_attn @ token_attn).transpose(2, 3)
-                    sv = (agg_attn * value_states).transpose(1, 2).reshape(len(think_attn), -1, self.DIMS)
-                    logits += self._qwen3_lang_model.layers[layers].self_attn.o_proj(sv)
-                logits = self._qwen3_lang_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
-                hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in \
-                           range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
-                logits = logits / hidden_norm
-                out = self.model.lm_head(logits)
-                indices = [completion_ids[case_id][answer_token] for answer_token in
-                           range(answer_start[case_id], answer_end[case_id] + 1)]
-                out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
-                    prompt_inputs.get("image_grid_thw")[case_id, 1]//2,
-                    prompt_inputs.get("image_grid_thw")[case_id, 2]//2)
-                saliency = torch.relu(out).detach().cpu().float().numpy()
-                saliency = cv2.resize(saliency, images[case_id].size)
-                attn_batch.append(saliency)
+        if self.reforward_saliency:
+            # --- Re-forward path: generate without output_attentions, then do a cheap
+            # per-case forward pass to extract attention slices for saliency. ---
+            thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
+            patch_offsets = [0]
+            if thw is not None:
+                for _i in range(thw.shape[0]):
+                    patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+
+            # Phase 1: one full-sequence re-forward per case; extract small attention
+            # slices and immediately free the large attention tensor.
+            all_think_attns = []  # list[list[Tensor]]  per case, per layer
+            all_token_attns = []
+            all_image_masks = []
+
+            with (
+                unwrap_model_for_generation(
+                    self.model_wrapped, self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as _unwrapped,
+                torch.no_grad(),
+                FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+            ):
+                for case_id in range(len(images)):
+                    _case_inputs = {
+                        "input_ids": prompt_completion_ids[case_id:case_id + 1],
+                        "attention_mask": attention_mask[case_id:case_id + 1],
+                    }
+                    if thw is not None:
+                        _case_inputs["pixel_values"] = prompt_inputs["pixel_values"][
+                            patch_offsets[case_id]:patch_offsets[case_id + 1]
+                        ]
+                        _case_inputs["image_grid_thw"] = thw[case_id:case_id + 1]
+                    if prompt_inputs.get("mm_token_type_ids") is not None:
+                        _compl_zeros = torch.zeros(
+                            1, completion_ids.size(1), dtype=torch.long, device=device
+                        )
+                        _case_inputs["mm_token_type_ids"] = torch.cat(
+                            [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
+                        )
+
+                    _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+
+                    _image_mask = prompt_ids[case_id] == 151655
+                    _think_per_layer, _token_per_layer = [], []
+                    for _l in range(self.NUM_LAYER):
+                        _attn = _fwd.attentions[_l]  # [1, heads, full_len, full_len]
+                        _think_per_layer.append(_attn[
+                            :, :,
+                            prompt_length + answer_start[case_id]:prompt_length + answer_end[case_id] + 1,
+                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1,
+                        ].clone())
+                        _token_per_layer.append(_attn[
+                            :, :,
+                            prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1,
+                            :prompt_length,
+                        ][:, :, :, _image_mask].clone())
+                    del _fwd
+                    all_think_attns.append(_think_per_layer)
+                    all_token_attns.append(_token_per_layer)
+                    all_image_masks.append(_image_mask)
+
+            # Phase 2: saliency computation using extracted slices (same math as
+            # original, adapted for the [1, heads, n_ans, think_len] slice shape).
+            with torch.no_grad():
+                for case_id in range(len(images)):
+                    _image_mask = all_image_masks[case_id]
+                    logits = 0
+                    for layers in range(self.NUM_LAYER):
+                        value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
+                        value_states = repeat_v(value_states, self.NUM_GROUP)
+                        value_states = value_states[:, :, :prompt_length, :]
+                        value_states = value_states[:, :, _image_mask, :]
+
+                        think_attn = all_think_attns[case_id][layers]   # [1, heads, n_ans, think_len]
+                        token_attn = all_token_attns[case_id][layers]   # [1, heads, think_len, n_img]
+                        token_attn = token_attn[:, :, :think_attn.shape[-1], :]
+                        num_answer = think_attn.shape[2]
+                        # permute to [n_ans, heads, n_img, 1] — same shape as original agg_attn
+                        agg_attn = (think_attn @ token_attn).permute(2, 1, 3, 0)
+                        sv = (agg_attn * value_states).transpose(1, 2).reshape(num_answer, -1, self.DIMS)
+                        logits += self._qwen3_lang_model.layers[layers].self_attn.o_proj(sv)
+                    logits = self._qwen3_lang_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
+                    hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
+                    logits = logits / hidden_norm
+                    out = self.model.lm_head(logits)
+                    indices = [completion_ids[case_id][answer_token] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)]
+                    out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
+                        prompt_inputs.get("image_grid_thw")[case_id, 1] // 2,
+                        prompt_inputs.get("image_grid_thw")[case_id, 2] // 2)
+                    saliency = torch.relu(out).detach().cpu().float().numpy()
+                    saliency = cv2.resize(saliency, images[case_id].size)
+                    attn_batch.append(saliency)
+
+        else:
+            # --- Original path: attentions stored during generate (output_attentions=True). ---
+            with torch.no_grad():
+                for case_id in range(len(images)):
+                    logits = 0
+                    for layers in range(self.NUM_LAYER):
+                        value_states = outputs.past_key_values.layers[layers].values.clone().detach()[[case_id]]
+                        value_states = repeat_v(value_states, self.NUM_GROUP)
+                        value_states = value_states[:, :, :prompt_length, :]
+                        value_states = value_states[:, :, prompt_ids[case_id] == 151655, :]
+                        think_attn = torch.cat([attentions[answer_token][layers]
+                                                    [[case_id], :, -1:,
+                                                prompt_length + think_start[case_id]:prompt_length + think_end[case_id] + 1]
+                                                for answer_token in range(answer_start[case_id], answer_end[case_id] + 1)],
+                                               dim=0)
+                        token_attn = torch.cat([attentions[i][layers][[case_id]][:, :, -1:,
+                                                prompt_completion_ids[case_id, :i + prompt_length] == 151655]
+                                                for i in range(think_start[case_id], think_end[case_id] + 1)], dim=2)
+                        token_attn = token_attn[:, :, :think_attn.shape[-1], :]
+                        agg_attn = (think_attn @ token_attn).transpose(2, 3)
+                        sv = (agg_attn * value_states).transpose(1, 2).reshape(len(think_attn), -1, self.DIMS)
+                        logits += self._qwen3_lang_model.layers[layers].self_attn.o_proj(sv)
+                    logits = self._qwen3_lang_model.norm(logits) * logits.norm(dim=-1, keepdim=True)
+                    hidden_norm = torch.cat([outputs.hidden_states[answer_token][-1][[case_id]] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)], dim=0).norm(dim=-1, keepdim=True)
+                    logits = logits / hidden_norm
+                    out = self.model.lm_head(logits)
+                    indices = [completion_ids[case_id][answer_token] for answer_token in
+                               range(answer_start[case_id], answer_end[case_id] + 1)]
+                    out = out[torch.arange(out.size(0)), :, torch.tensor(indices)].sum(dim=0).reshape(
+                        prompt_inputs.get("image_grid_thw")[case_id, 1] // 2,
+                        prompt_inputs.get("image_grid_thw")[case_id, 2] // 2)
+                    saliency = torch.relu(out).detach().cpu().float().numpy()
+                    saliency = cv2.resize(saliency, images[case_id].size)
+                    attn_batch.append(saliency)
 
         torch.cuda.empty_cache()
 
