@@ -91,6 +91,4 @@ def openai_reward(completions, solution, problem, **kwargs):
         # query_gpt4o returns None when no "Score: N" is present in the response.
         return score if score is not None else 0
 
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=len(problem_list)) as executor:
-        return list(executor.map(safe_query, problem_list, ground_truth_list, prediction_list))
+    return [safe_query(question, ground_truth, prediction) for question, ground_truth, prediction in zip(problem_list, ground_truth_list, prediction_list)]
