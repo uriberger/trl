@@ -565,6 +565,16 @@ class GRPOTrainer(Trainer):
             model = self._enable_gradient_checkpointing(model, args)
         self.is_gradient_checkpointing = args.gradient_checkpointing
 
+        # FA2 cannot return attention weights, so reforward_saliency is required with it.
+        if getattr(model.config, "_attn_implementation", None) == "flash_attention_2" and not self.reforward_saliency:
+            import warnings
+            warnings.warn(
+                "flash_attention_2 does not support output_attentions=True during generate; "
+                "forcing reforward_saliency=True.",
+                UserWarning,
+            )
+            self.reforward_saliency = True
+
         # Qwen3-VL (transformers 5.13): `language_model` lives inside the Qwen3VLModel
         # (`raw_model.model.language_model`). After get_peft_model(), `model.model` resolves
         # via PEFT's __getattr__ to `base_model.model` (Qwen3VLForConditionalGeneration), which
@@ -1869,6 +1879,11 @@ class GRPOTrainer(Trainer):
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
+                # FA2 can't return attention weights; temporarily use SDPA for the
+                # re-forward passes (dispatch is resolved at forward time from config).
+                _saved_attn_impl = _unwrapped.config._attn_implementation
+                if _saved_attn_impl == "flash_attention_2":
+                    _unwrapped.config._attn_implementation = "sdpa"
                 for case_id in range(len(images)):
                     _case_inputs = {
                         "input_ids": prompt_completion_ids[case_id:case_id + 1],
@@ -1907,6 +1922,8 @@ class GRPOTrainer(Trainer):
                     all_think_attns.append(_think_per_layer)
                     all_token_attns.append(_token_per_layer)
                     all_image_masks.append(_image_mask)
+                if _saved_attn_impl == "flash_attention_2":
+                    _unwrapped.config._attn_implementation = _saved_attn_impl
 
             # Phase 2: saliency computation using extracted slices (same math as
             # original, adapted for the [1, heads, n_ans, think_len] slice shape).
