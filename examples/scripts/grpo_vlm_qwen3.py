@@ -211,6 +211,7 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
+        reforward_saliency=script_args.reforward_saliency,
     )
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)

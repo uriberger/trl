@@ -82,6 +82,13 @@ class ScriptArguments:
             "https://github.com/huggingface/transformers/issues/22482#issuecomment-1595790992."
         },
     )
+    reforward_saliency: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to compute saliency via a separate re-forward pass instead of capturing attention "
+            "weights during generate(). Required when max_completion_length > 1024 to avoid OOM."
+        },
+    )
 
 
 def init_zero_verbose():
