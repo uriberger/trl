@@ -74,6 +74,20 @@ from math_verify import LatexExtractionConfig, parse, verify
 from transformers import TrainerCallback
 
 
+class SyncSaveStepsCallback(TrainerCallback):
+    """Fix save_steps in TrainerState after a resume.
+
+    When resuming, Trainer replaces self.state with the JSON loaded from the
+    checkpoint.  That JSON carries the *old* save_steps value, but
+    DefaultFlowCallback uses state.save_steps (not args.save_steps) to decide
+    when to save.  on_train_begin fires after the JSON is loaded, so we can
+    patch the value here to match the current --save_steps arg.
+    """
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        state.save_steps = args.save_steps
+
+
 class TieredCheckpointCallback(TrainerCallback):
     """Keep every `milestone_steps` checkpoint permanently; for all other
     `frequent_steps` checkpoints, keep only the most recent one.
@@ -337,6 +351,7 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
     )
+    trainer.add_callback(SyncSaveStepsCallback())
     trainer.add_callback(TieredCheckpointCallback(training_args.output_dir))
 
     maybe_wandb_rewind(trainer, training_args)

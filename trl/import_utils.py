@@ -22,22 +22,29 @@ from packaging import version
 from transformers.utils.import_utils import _is_package_available
 
 
+def _pkg_available(name: str) -> bool:
+    """Return a plain bool from _is_package_available, compatible with both
+    transformers <=4.x (returns bool) and >=5.x (returns (bool, version))."""
+    result = _is_package_available(name)
+    return result[0] if isinstance(result, tuple) else result
+
+
 LIGER_KERNEL_MIN_VERSION = "0.5.8"
 
 # Use same as transformers.utils.import_utils
-_deepspeed_available = _is_package_available("deepspeed")
-_diffusers_available = _is_package_available("diffusers")
-_fastapi_available = _is_package_available("fastapi")
+_deepspeed_available = _pkg_available("deepspeed")
+_diffusers_available = _pkg_available("diffusers")
+_fastapi_available = _pkg_available("fastapi")
 _is_liger_kernel_available, _liger_kernel_version = _is_package_available("liger_kernel", return_version=True)
-_llm_blender_available = _is_package_available("llm_blender")
-_mergekit_available = _is_package_available("mergekit")
-_pydantic_available = _is_package_available("pydantic")
-_requests_available = _is_package_available("requests")
-_unsloth_available = _is_package_available("unsloth")
-_uvicorn_available = _is_package_available("uvicorn")
-_vllm_available = _is_package_available("vllm")
-_vllm_ascend_available = _is_package_available("vllm_ascend")
-_joblib_available = _is_package_available("joblib")
+_llm_blender_available = _pkg_available("llm_blender")
+_mergekit_available = _pkg_available("mergekit")
+_pydantic_available = _pkg_available("pydantic")
+_requests_available = _pkg_available("requests")
+_unsloth_available = _pkg_available("unsloth")
+_uvicorn_available = _pkg_available("uvicorn")
+_vllm_available = _pkg_available("vllm")
+_vllm_ascend_available = _pkg_available("vllm_ascend")
+_joblib_available = _pkg_available("joblib")
 
 
 def is_deepspeed_available() -> bool:
