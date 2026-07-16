@@ -1457,14 +1457,19 @@ class GRPOTrainer(Trainer):
         # Walk the module tree and swap each ZeRO param out for a plain buffer.
         # nn.Module.__getattr__ checks _buffers after _parameters, so self.weight
         # (etc.) continues to resolve correctly for nn.Embedding, nn.Linear, etc.
-        seen_ids: set = set()
+        #
+        # A single Parameter can be referenced by several modules: T5 ties `shared`
+        # and `encoder.embed_tokens` to the *same* weight object (different module
+        # objects, same param / same ds_id). Every referencing module must be
+        # swapped — deduping by ds_id here would swap only `shared` and leave
+        # `encoder.embed_tokens.weight` pointing at the 1-D shard, which is exactly
+        # what breaks F.embedding ("'weight' must be 2-D"). `full_data` already
+        # dedups the gather, so registering the same tensor on each module re-ties
+        # them at no extra memory cost.
         for sub in module.modules():
             for pname, param in list(sub._parameters.items()):
                 if param is None or not is_zero_param(param):
                     continue
-                if param.ds_id in seen_ids:
-                    continue
-                seen_ids.add(param.ds_id)
                 data = full_data.get(param.ds_id)
                 if data is None:
                     continue
