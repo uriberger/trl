@@ -18,6 +18,8 @@ import os
 import re
 import textwrap
 import warnings
+
+import numpy as np
 from collections import defaultdict, deque
 from collections.abc import Sequence, Sized
 from contextlib import nullcontext
@@ -510,8 +512,24 @@ class GRPOTrainer(Trainer):
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
         reforward_saliency: bool = True,
+        reward_variant: str = "saliency_r1",
+        overlap_layer: int = 22,
+        overlap_heads=(28, 31),
+        token_reduction: str = "mean",
     ):
         self.reforward_saliency = reforward_saliency
+        # --- attention-overlap reward config (reward_variant="ours") ---
+        self.reward_variant = reward_variant
+        self.overlap_layer = int(overlap_layer)
+        if isinstance(overlap_heads, str):
+            overlap_heads = [int(h) for h in overlap_heads.split(",") if h.strip() != ""]
+        self.overlap_heads = list(overlap_heads)
+        self.token_reduction = token_reduction
+        self._overlap_clf = None  # lazily loaded FLAN-T5 steps classifier
+        if self.reward_variant == "ours" and not self.reforward_saliency:
+            # The "ours" extraction needs full per-token attention over the whole
+            # prompt+completion, which only the re-forward path provides.
+            self.reforward_saliency = True
 
         # Args
         if args is None:
@@ -1405,6 +1423,136 @@ class GRPOTrainer(Trainer):
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
+    # ------------------------------------------------------------------
+    # Attention-overlap reward (reward_variant="ours")
+    # ------------------------------------------------------------------
+    def _get_overlap_classifier(self):
+        """Lazily load the FLAN-T5 observe-step classifier (once per process)."""
+        if self._overlap_clf is None:
+            from .overlap_steps import OverlapStepsClassifier
+            # Keep the tiny FLAN-T5-base on CPU by default (frees GPU for the policy);
+            # override with OVERLAP_STEPS_DEVICE.
+            dev = os.environ.get("OVERLAP_STEPS_DEVICE", "cpu")
+            # Under DeepSpeed ZeRO-3 all nn.Parameter creation is intercepted and the
+            # weights are partitioned across ranks (making embed_tokens.weight 1-D).
+            # Disable ZeRO init for this auxiliary module so it stays on a single rank.
+            try:
+                import deepspeed
+                _ctx = deepspeed.zero.Init(enabled=False)
+            except (ImportError, AttributeError):
+                from contextlib import nullcontext
+                _ctx = nullcontext()
+            with _ctx:
+                self._overlap_clf = OverlapStepsClassifier.load(device=dev)
+        return self._overlap_clf
+
+    def _compute_overlap_step_maps(
+        self, inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+        prompt_ids, prompt_length, completion_ids, output_text,
+        think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+    ):
+        """Per completion -> list of {"map": (grid_h, grid_w) float32, "text": str} for
+        each grounded-able observe step. Raw attention at self.overlap_layer, mean over
+        self.overlap_heads, ReLU, token-reduced (self.token_reduction) over the step's
+        tokens. Segmentation via sentence-split + FLAN-T5 observe classifier. The reward
+        fn (think_overlap_reward) does the DINO grounding + mean_in metric.
+        """
+        from .overlap_steps import segment_observe_steps
+
+        clf = self._get_overlap_classifier()
+        L = self.overlap_layer
+        heads = self.overlap_heads
+        tr = self.token_reduction
+
+        thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
+        patch_offsets = [0]
+        if thw is not None:
+            for _i in range(thw.shape[0]):
+                patch_offsets.append(patch_offsets[-1] + int(thw[_i].prod().item()))
+
+        results = [[] for _ in range(len(images))]
+
+        with (
+            unwrap_model_for_generation(
+                self.model_wrapped, self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+            ) as _unwrapped,
+            torch.no_grad(),
+            FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
+        ):
+            _saved_attn_impl = _unwrapped.config._attn_implementation
+            if _saved_attn_impl == "flash_attention_2":
+                _unwrapped.config._attn_implementation = "sdpa"
+
+            for case_id in range(len(images)):
+                ts, te = think_start[case_id], think_end[case_id]
+                # Skip malformed / empty think spans (reward -> masked/neutral).
+                if not invalid[case_id] or te <= ts:
+                    continue
+
+                _case_inputs = {
+                    "input_ids": prompt_completion_ids[case_id:case_id + 1],
+                    "attention_mask": attention_mask[case_id:case_id + 1],
+                }
+                if thw is not None:
+                    _case_inputs["pixel_values"] = prompt_inputs["pixel_values"][
+                        patch_offsets[case_id]:patch_offsets[case_id + 1]
+                    ]
+                    _case_inputs["image_grid_thw"] = thw[case_id:case_id + 1]
+                if prompt_inputs.get("mm_token_type_ids") is not None:
+                    _compl_zeros = torch.zeros(1, completion_ids.size(1), dtype=torch.long, device=device)
+                    _case_inputs["mm_token_type_ids"] = torch.cat(
+                        [prompt_inputs["mm_token_type_ids"][case_id:case_id + 1], _compl_zeros], dim=1
+                    )
+
+                _fwd = _unwrapped(**_case_inputs, output_attentions=True, output_hidden_states=False)
+
+                _image_mask = prompt_ids[case_id] == 151655
+                # [1, heads, think_len, n_patches] : observe-token query rows -> image-patch key cols
+                raw = _fwd.attentions[L][
+                    :, heads,
+                    prompt_length + ts:prompt_length + te + 1,
+                    :prompt_length,
+                ][:, :, :, _image_mask]
+                # [n_heads_sel, think_len, n_patches]; ReLU is a no-op on softmax weights but kept per spec
+                per_tok = torch.relu(raw)[0].float().cpu().numpy()
+                del _fwd, raw
+
+                gh = int(thw[case_id, 1].item()) // 2
+                gw = int(thw[case_id, 2].item()) // 2
+
+                question = inputs[case_id].get("problem", "") if isinstance(inputs[case_id], dict) else ""
+                steps = segment_observe_steps(
+                    output_text[case_id], think_start_idx[case_id], think_end_idx[case_id],
+                    out, case_id, ts, te, question, clf,
+                )
+
+                step_maps = []
+                for step_text, tok_a, tok_b in steps:
+                    la = tok_a - ts
+                    lb = tok_b - ts
+                    if lb <= la:
+                        continue
+                    seg = per_tok[:, la:lb, :]  # [n_heads, span_len, n_patches]
+                    # token-reduce per head over the step's tokens, THEN mean over heads
+                    # (order matters for max/min; matches the offline attn_tr_* reference).
+                    if tr == "max":
+                        red = seg.max(axis=1)
+                    elif tr == "min":
+                        red = seg.min(axis=1)
+                    else:
+                        red = seg.mean(axis=1)
+                    m = np.maximum(red.mean(axis=0), 0.0)  # [n_patches]
+                    if m.size != gh * gw:
+                        continue
+                    step_maps.append({"map": m.reshape(gh, gw).astype(np.float32), "text": step_text})
+                results[case_id] = step_maps
+
+            if _saved_attn_impl == "flash_attention_2":
+                _unwrapped.config._attn_implementation = _saved_attn_impl
+
+        return results
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1856,7 +2004,15 @@ class GRPOTrainer(Trainer):
         '''
         attn_batch = []
 
-        if self.reforward_saliency:
+        if self.reward_variant == "ours":
+            # --- Attention-overlap reward: raw per-head observe->patch attention at a
+            # single layer, per observe step, instead of the whole-completion rollout. ---
+            attn_batch = self._compute_overlap_step_maps(
+                inputs, images, prompt_inputs, prompt_completion_ids, attention_mask,
+                prompt_ids, prompt_length, completion_ids, output_text,
+                think_start_idx, think_end_idx, think_start, think_end, invalid, out, device,
+            )
+        elif self.reforward_saliency:
             # --- Re-forward path: generate without output_attentions, then do a cheap
             # per-case forward pass to extract attention slices for saliency. ---
             thw = prompt_inputs.get("image_grid_thw")  # [batch, 3]
