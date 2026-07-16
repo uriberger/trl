@@ -1426,6 +1426,51 @@ class GRPOTrainer(Trainer):
     # ------------------------------------------------------------------
     # Attention-overlap reward (reward_variant="ours")
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _demote_zero3_params(module: nn.Module) -> None:
+        """Gather ZeRO-3-partitioned parameters back to full tensors and store them as
+        plain buffers so the module runs as ordinary tensors for the rest of training.
+
+        Under ZeRO-3, every nn.Parameter created anywhere in the process is intercepted
+        and sharded across ranks into a 1-D flat tensor. deepspeed.zero.Init(enabled=False)
+        is a no-op when the outer ZeRO-3 context is already active (it just skips
+        installing *new* patches, leaving the existing ones in place). The only reliable
+        escape is to gather the shards back to full tensors and then remove the parameters
+        from ZeRO-3's tracking by converting them to buffers.
+        """
+        try:
+            import deepspeed
+            from deepspeed.runtime.zero.utils import is_zero_param
+        except ImportError:
+            return
+
+        zero_params = [p for p in module.parameters() if is_zero_param(p)]
+        if not zero_params:
+            return
+
+        # Gather all shards back to their full shapes on each rank simultaneously.
+        with deepspeed.zero.GatheredParameters(zero_params, modifier_rank=None):
+            # ds_id is stable across gather/partition cycles; use it as key.
+            full_data = {p.ds_id: p.data.clone().cpu() for p in zero_params}
+
+        # Walk the module tree and swap each ZeRO param out for a plain buffer.
+        # nn.Module.__getattr__ checks _buffers after _parameters, so self.weight
+        # (etc.) continues to resolve correctly for nn.Embedding, nn.Linear, etc.
+        seen_ids: set = set()
+        for sub in module.modules():
+            for pname, param in list(sub._parameters.items()):
+                if param is None or not is_zero_param(param):
+                    continue
+                if param.ds_id in seen_ids:
+                    continue
+                seen_ids.add(param.ds_id)
+                data = full_data.get(param.ds_id)
+                if data is None:
+                    continue
+                del sub._parameters[pname]
+                sub.register_buffer(pname, data)
+
     def _get_overlap_classifier(self):
         """Lazily load the FLAN-T5 observe-step classifier (once per process)."""
         if self._overlap_clf is None:
@@ -1433,17 +1478,12 @@ class GRPOTrainer(Trainer):
             # Keep the tiny FLAN-T5-base on CPU by default (frees GPU for the policy);
             # override with OVERLAP_STEPS_DEVICE.
             dev = os.environ.get("OVERLAP_STEPS_DEVICE", "cpu")
-            # Under DeepSpeed ZeRO-3 all nn.Parameter creation is intercepted and the
-            # weights are partitioned across ranks (making embed_tokens.weight 1-D).
-            # Disable ZeRO init for this auxiliary module so it stays on a single rank.
-            try:
-                import deepspeed
-                _ctx = deepspeed.zero.Init(enabled=False)
-            except (ImportError, AttributeError):
-                from contextlib import nullcontext
-                _ctx = nullcontext()
-            with _ctx:
-                self._overlap_clf = OverlapStepsClassifier.load(device=dev)
+            self._overlap_clf = OverlapStepsClassifier.load(device=dev)
+            # ZeRO-3 will have partitioned the T5 weights into 1-D shards across ranks,
+            # causing embed_tokens.weight to be 1-D and breaking F.embedding. Gather
+            # everything back and convert to plain buffers so subsequent inference calls
+            # work without any distributed overhead.
+            self._demote_zero3_params(self._overlap_clf)
         return self._overlap_clf
 
     def _compute_overlap_step_maps(
